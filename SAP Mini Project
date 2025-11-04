@@ -1,0 +1,305 @@
+*&---------------------------------------------------------------------*
+*& Report ZMM_OPEN_PO_MONITOR
+*&---------------------------------------------------------------------*
+*& Purpose : Display open PO items by vendor / plant / date
+*& Author  : <Your Name>
+*&---------------------------------------------------------------------*
+
+REPORT zmm_open_po_monitor.
+
+*---------------------------------------------------------------------*
+* TYPE DECLARATIONS
+*---------------------------------------------------------------------*
+TYPES: BEGIN OF ty_output,
+         ebeln        TYPE ekko-ebeln,   "PO Number
+         ebelp        TYPE ekpo-ebelp,   "PO Item
+         lifnr        TYPE ekko-lifnr,   "Vendor
+         name1        TYPE lfa1-name1,   "Vendor Name
+         bukrs        TYPE ekko-bukrs,   "Company Code
+         bedat        TYPE ekko-bedat,   "PO Date
+         matnr        TYPE ekpo-matnr,   "Material
+         maktx        TYPE makt-maktx,   "Material Desc
+         werks        TYPE ekpo-werks,   "Plant
+         menge        TYPE ekpo-menge,   "PO Quantity
+         wemng        TYPE ekpo-wemng,   "GR Quantity
+         open_qty     TYPE ekpo-menge,   "Open Qty (calculated)
+         loekz        TYPE ekpo-loekz,   "Deletion Indicator
+         elikz        TYPE ekpo-elikz,   "Delivery Completed
+       END OF ty_output.
+
+DATA: gt_output TYPE STANDARD TABLE OF ty_output,
+      gs_output TYPE ty_output.
+
+*---------------------------------------------------------------------*
+* SELECTION-SCREEN
+*---------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-001.
+PARAMETERS: p_open  TYPE abap_bool DEFAULT abap_true
+            AS CHECKBOX USER-COMMAND uc1.
+
+SELECT-OPTIONS:
+  s_ebeln FOR ekko-ebeln,   "PO Number
+  s_lifnr FOR ekko-lifnr,   "Vendor
+  s_werks FOR ekpo-werks,   "Plant
+  s_bedat FOR ekko-bedat.   "PO Date
+SELECTION-SCREEN END OF BLOCK b1.
+
+* Text-001: 'Selection Criteria'
+
+*---------------------------------------------------------------------*
+* INITIALIZATION
+*---------------------------------------------------------------------*
+INITIALIZATION.
+  " Set some default date range (last 90 days)
+  s_bedat-sign   = 'I'.
+  s_bedat-option = 'BT'.
+  s_bedat-low    = sy-datum - 90.
+  s_bedat-high   = sy-datum.
+  APPEND s_bedat.
+
+*---------------------------------------------------------------------*
+* START-OF-SELECTION
+*---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  PERFORM get_data.
+  IF gt_output IS INITIAL.
+    MESSAGE 'No data found for given selection' TYPE 'S'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+  PERFORM display_alv.
+
+*---------------------------------------------------------------------*
+* FORM get_data
+*---------------------------------------------------------------------*
+FORM get_data.
+
+  DATA: lt_ekko TYPE STANDARD TABLE OF ekko,
+        lt_ekpo TYPE STANDARD TABLE OF ekpo,
+        ls_ekko TYPE ekko,
+        ls_ekpo TYPE ekpo.
+
+  "1. Get PO headers according to header criteria
+  SELECT ebeln
+         lifnr
+         bukrs
+         bedat
+    FROM ekko
+    INTO TABLE lt_ekko
+   WHERE ebeln IN s_ebeln
+     AND lifnr IN s_lifnr
+     AND bedat IN s_bedat.
+
+  IF lt_ekko IS INITIAL.
+    EXIT.
+  ENDIF.
+
+  "2. Get PO items for those headers + plant filter
+  SELECT ebeln
+         ebelp
+         matnr
+         werks
+         menge
+         wemng
+         loekz
+         elikz
+    FROM ekpo
+    INTO TABLE lt_ekpo
+   FOR ALL ENTRIES IN lt_ekko
+   WHERE ebeln = lt_ekko-ebeln
+     AND werks IN s_werks.
+
+  IF lt_ekpo IS INITIAL.
+    EXIT.
+  ENDIF.
+
+  "3. Join header + item in internal tables
+  CLEAR gt_output.
+
+  LOOP AT lt_ekpo INTO ls_ekpo.
+    READ TABLE lt_ekko INTO ls_ekko WITH KEY ebeln = ls_ekpo-ebeln.
+    IF sy-subrc <> 0.
+      CONTINUE.
+    ENDIF.
+
+    CLEAR gs_output.
+
+    gs_output-ebeln = ls_ekpo-ebeln.
+    gs_output-ebelp = ls_ekpo-ebelp.
+    gs_output-lifnr = ls_ekko-lifnr.
+    gs_output-bukrs = ls_ekko-bukrs.
+    gs_output-bedat = ls_ekko-bedat.
+    gs_output-matnr = ls_ekpo-matnr.
+    gs_output-werks = ls_ekpo-werks.
+    gs_output-menge = ls_ekpo-menge.
+    gs_output-wemng = ls_ekpo-wemng.
+    gs_output-open_qty = ls_ekpo-menge - ls_ekpo-wemng.
+    gs_output-loekz = ls_ekpo-loekz.
+    gs_output-elikz = ls_ekpo-elikz.
+
+    "If user wants only open items, filter here
+    IF p_open = abap_true.
+      IF gs_output-loekz IS NOT INITIAL
+         OR gs_output-elikz = 'X'
+         OR gs_output-open_qty <= 0.
+        CONTINUE.
+      ENDIF.
+    ENDIF.
+
+    APPEND gs_output TO gt_output.
+
+  ENDLOOP.
+
+  "4. Enrich with Vendor Name
+  PERFORM enrich_vendor.
+
+  "5. Enrich with Material Description
+  PERFORM enrich_material.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM enrich_vendor
+*---------------------------------------------------------------------*
+FORM enrich_vendor.
+
+  DATA: lt_lfa1 TYPE STANDARD TABLE OF lfa1,
+        ls_lfa1 TYPE lfa1,
+        lt_lifnr TYPE STANDARD TABLE OF lfa1-lifnr,
+        ls_lifnr TYPE lfa1-lifnr.
+
+  "Get distinct vendors
+  CLEAR lt_lifnr.
+  LOOP AT gt_output INTO gs_output.
+    ls_lifnr = gs_output-lifnr.
+    COLLECT ls_lifnr INTO lt_lifnr.
+  ENDLOOP.
+
+  IF lt_lifnr IS INITIAL.
+    RETURN.
+  ENDIF.
+
+  "Read vendor master
+  SELECT lifnr
+         name1
+    FROM lfa1
+    INTO TABLE lt_lfa1
+   FOR ALL ENTRIES IN lt_lifnr
+   WHERE lifnr = lt_lifnr-table_line.
+
+  LOOP AT gt_output INTO gs_output.
+    READ TABLE lt_lfa1 INTO ls_lfa1
+      WITH KEY lifnr = gs_output-lifnr.
+    IF sy-subrc = 0.
+      gs_output-name1 = ls_lfa1-name1.
+      MODIFY gt_output FROM gs_output.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM enrich_material
+*---------------------------------------------------------------------*
+FORM enrich_material.
+
+  DATA: lt_makt TYPE STANDARD TABLE OF makt,
+        ls_makt TYPE makt,
+        lt_matnr TYPE STANDARD TABLE OF mara-matnr,
+        ls_matnr TYPE mara-matnr.
+
+  CLEAR lt_matnr.
+  LOOP AT gt_output INTO gs_output.
+    IF gs_output-matnr IS NOT INITIAL.
+      ls_matnr = gs_output-matnr.
+      COLLECT ls_matnr INTO lt_matnr.
+    ENDIF.
+  ENDLOOP.
+
+  IF lt_matnr IS INITIAL.
+    RETURN.
+  ENDIF.
+
+  "Using language key from SY-LANGU
+  SELECT matnr
+         maktx
+    FROM makt
+    INTO TABLE lt_makt
+   FOR ALL ENTRIES IN lt_matnr
+   WHERE matnr = lt_matnr-table_line
+     AND spras = sy-langu.
+
+  LOOP AT gt_output INTO gs_output.
+    READ TABLE lt_makt INTO ls_makt
+      WITH KEY matnr = gs_output-matnr.
+    IF sy-subrc = 0.
+      gs_output-maktx = ls_makt-maktx.
+      MODIFY gt_output FROM gs_output.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM display_alv
+*---------------------------------------------------------------------*
+FORM display_alv.
+
+  DATA: lo_alv  TYPE REF TO cl_salv_table,
+        lo_cols TYPE REF TO cl_salv_columns_table,
+        lo_col  TYPE REF TO cl_salv_column.
+
+  TRY.
+      cl_salv_table=>factory(
+        IMPORTING
+          r_salv_table = lo_alv
+        CHANGING
+          t_table      = gt_output ).
+
+      lo_cols = lo_alv->get_columns( ).
+
+      "Set column headings (optional)
+      lo_col = lo_cols->get_column( 'EBELN' ).
+      lo_col->set_long_text( 'PO Number' ).
+
+      lo_col = lo_cols->get_column( 'EBELP' ).
+      lo_col->set_long_text( 'Item' ).
+
+      lo_col = lo_cols->get_column( 'LIFNR' ).
+      lo_col->set_long_text( 'Vendor' ).
+
+      lo_col = lo_cols->get_column( 'NAME1' ).
+      lo_col->set_long_text( 'Vendor Name' ).
+
+      lo_col = lo_cols->get_column( 'BEDAT' ).
+      lo_col->set_long_text( 'PO Date' ).
+
+      lo_col = lo_cols->get_column( 'MATNR' ).
+      lo_col->set_long_text( 'Material' ).
+
+      lo_col = lo_cols->get_column( 'MAKTX' ).
+      lo_col->set_long_text( 'Material Desc' ).
+
+      lo_col = lo_cols->get_column( 'WERKS' ).
+      lo_col->set_long_text( 'Plant' ).
+
+      lo_col = lo_cols->get_column( 'MENGE' ).
+      lo_col->set_long_text( 'PO Qty' ).
+
+      lo_col = lo_cols->get_column( 'WEMNG' ).
+      lo_col->set_long_text( 'GR Qty' ).
+
+      lo_col = lo_cols->get_column( 'OPEN_QTY' ).
+      lo_col->set_long_text( 'Open Qty' ).
+
+      "Allow standard ALV features
+      lo_alv->get_functions( )->set_all( abap_true ).
+
+      lo_alv->display( ).
+
+    CATCH cx_salv_msg INTO DATA(lx_msg).
+      MESSAGE lx_msg->get_text( ) TYPE 'E'.
+  ENDTRY.
+
+ENDFORM.

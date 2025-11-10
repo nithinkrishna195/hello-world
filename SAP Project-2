@@ -1,0 +1,256 @@
+#ABAP
+
+*&---------------------------------------------------------------------*
+*& Report  ZFI_AR_OVERDUE
+*&---------------------------------------------------------------------*
+*& Purpose : Display overdue open customer items with aging buckets
+*& Author  : <Your Name>
+*&---------------------------------------------------------------------*
+
+REPORT zfi_ar_overdue.
+
+*---------------------------------------------------------------------*
+* TYPE DECLARATIONS
+*---------------------------------------------------------------------*
+TYPES: BEGIN OF ty_output,
+         bukrs        TYPE bsid-bukrs,   "Company Code
+         kunnr        TYPE bsid-kunnr,   "Customer
+         name1        TYPE kna1-name1,   "Customer Name
+         belnr        TYPE bsid-belnr,   "Document Number
+         gjahr        TYPE bsid-gjahr,   "Fiscal Year
+         buzei        TYPE bsid-buzei,   "Line Item
+         budat        TYPE bsid-budat,   "Posting Date
+         faedt        TYPE bsid-faedt,   "Net Due Date
+         dmbtr        TYPE bsid-dmbtr,   "Amount in Doc Currency
+         waers        TYPE bsid-waers,   "Currency
+         days_overdue TYPE i,            "Days overdue
+         bucket       TYPE char15,       "Aging bucket
+       END OF ty_output.
+
+DATA: gt_output TYPE STANDARD TABLE OF ty_output,
+      gs_output TYPE ty_output.
+
+*---------------------------------------------------------------------*
+* SELECTION-SCREEN
+*---------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-t01.
+SELECT-OPTIONS:
+  s_bukrs FOR bsid-bukrs,  "Company Code
+  s_kunnr FOR bsid-kunnr,  "Customer
+  s_budat FOR bsid-budat.  "Posting Date
+PARAMETERS:
+  p_minov TYPE i DEFAULT 1.   "Minimum days overdue (e.g. 1)
+SELECTION-SCREEN END OF BLOCK b1.
+
+* TEXT-t01: 'Customer Overdue Receivables Selection'
+
+*---------------------------------------------------------------------*
+* INITIALIZATION
+*---------------------------------------------------------------------*
+INITIALIZATION.
+  "Default: last 90 days posting date
+  s_budat-sign   = 'I'.
+  s_budat-option = 'BT'.
+  s_budat-low    = sy-datum - 90.
+  s_budat-high   = sy-datum.
+  APPEND s_budat.
+
+*---------------------------------------------------------------------*
+* START-OF-SELECTION
+*---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  PERFORM get_data.
+  IF gt_output IS INITIAL.
+    MESSAGE 'No overdue open items found for given selection' TYPE 'S'.
+    LEAVE LIST-PROCESSING.
+  ENDIF.
+
+  PERFORM display_alv.
+
+*---------------------------------------------------------------------*
+* FORM get_data
+*---------------------------------------------------------------------*
+FORM get_data.
+
+  DATA: lt_bsid     TYPE STANDARD TABLE OF bsid,
+        ls_bsid     TYPE bsid,
+        lv_days     TYPE i.
+
+  "1. Get open items from BSID (already open items table)
+  SELECT bukrs
+         kunnr
+         belnr
+         gjahr
+         buzei
+         budat
+         faedt
+         dmbtr
+         waers
+    FROM bsid
+    INTO TABLE lt_bsid
+   WHERE bukrs IN s_bukrs
+     AND kunnr IN s_kunnr
+     AND budat IN s_budat.
+
+  IF lt_bsid IS INITIAL.
+    EXIT.
+  ENDIF.
+
+  CLEAR gt_output.
+
+  LOOP AT lt_bsid INTO ls_bsid.
+
+    "If due date is initial, skip (no overdue logic)
+    IF ls_bsid-faedt IS INITIAL.
+      CONTINUE.
+    ENDIF.
+
+    "Calculate days overdue
+    lv_days = sy-datum - ls_bsid-faedt.
+
+    "We only want items at least p_minov days overdue
+    IF lv_days < p_minov.
+      CONTINUE.
+    ENDIF.
+
+    CLEAR gs_output.
+
+    gs_output-bukrs = ls_bsid-bukrs.
+    gs_output-kunnr = ls_bsid-kunnr.
+    gs_output-belnr = ls_bsid-belnr.
+    gs_output-gjahr = ls_bsid-gjahr.
+    gs_output-buzei = ls_bsid-buzei.
+    gs_output-budat = ls_bsid-budat.
+    gs_output-faedt = ls_bsid-faedt.
+    gs_output-dmbtr = ls_bsid-dmbtr.
+    gs_output-waers = ls_bsid-waers.
+    gs_output-days_overdue = lv_days.
+
+    "Determine aging bucket
+    IF lv_days <= 0.
+      gs_output-bucket = 'Not due'.
+    ELSEIF lv_days BETWEEN 1 AND 30.
+      gs_output-bucket = '0-30 days'.
+    ELSEIF lv_days BETWEEN 31 AND 60.
+      gs_output-bucket = '31-60 days'.
+    ELSEIF lv_days BETWEEN 61 AND 90.
+      gs_output-bucket = '61-90 days'.
+    ELSE.
+      gs_output-bucket = '90+ days'.
+    ENDIF.
+
+    APPEND gs_output TO gt_output.
+
+  ENDLOOP.
+
+  "2. Enrich with Customer Name
+  PERFORM enrich_customer.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM enrich_customer
+*---------------------------------------------------------------------*
+FORM enrich_customer.
+
+  DATA: lt_kna1     TYPE STANDARD TABLE OF kna1,
+        ls_kna1     TYPE kna1,
+        lt_kunnr    TYPE STANDARD TABLE OF kna1-kunnr,
+        ls_kunnr2   TYPE kna1-kunnr.
+
+  "Get distinct customers from output
+  CLEAR lt_kunnr.
+  LOOP AT gt_output INTO gs_output.
+    ls_kunnr2 = gs_output-kunnr.
+    COLLECT ls_kunnr2 INTO lt_kunnr.
+  ENDLOOP.
+
+  IF lt_kunnr IS INITIAL.
+    RETURN.
+  ENDIF.
+
+  "Read customer master
+  SELECT kunnr
+         name1
+    FROM kna1
+    INTO TABLE lt_kna1
+   FOR ALL ENTRIES IN lt_kunnr
+   WHERE kunnr = lt_kunnr-table_line.
+
+  LOOP AT gt_output INTO gs_output.
+    READ TABLE lt_kna1 INTO ls_kna1
+      WITH KEY kunnr = gs_output-kunnr.
+    IF sy-subrc = 0.
+      gs_output-name1 = ls_kna1-name1.
+      MODIFY gt_output FROM gs_output.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.
+
+*---------------------------------------------------------------------*
+* FORM display_alv
+*---------------------------------------------------------------------*
+FORM display_alv.
+
+  DATA: lo_alv  TYPE REF TO cl_salv_table,
+        lo_cols TYPE REF TO cl_salv_columns_table,
+        lo_col  TYPE REF TO cl_salv_column.
+
+  TRY.
+      cl_salv_table=>factory(
+        IMPORTING
+          r_salv_table = lo_alv
+        CHANGING
+          t_table      = gt_output ).
+
+      lo_cols = lo_alv->get_columns( ).
+
+      "Set some friendly column texts
+      lo_col = lo_cols->get_column( 'BUKRS' ).
+      lo_col->set_long_text( 'Company Code' ).
+
+      lo_col = lo_cols->get_column( 'KUNNR' ).
+      lo_col->set_long_text( 'Customer' ).
+
+      lo_col = lo_cols->get_column( 'NAME1' ).
+      lo_col->set_long_text( 'Customer Name' ).
+
+      lo_col = lo_cols->get_column( 'BELNR' ).
+      lo_col->set_long_text( 'Document Number' ).
+
+      lo_col = lo_cols->get_column( 'GJAHR' ).
+      lo_col->set_long_text( 'Fiscal Year' ).
+
+      lo_col = lo_cols->get_column( 'BUZEI' ).
+      lo_col->set_long_text( 'Line Item' ).
+
+      lo_col = lo_cols->get_column( 'BUDAT' ).
+      lo_col->set_long_text( 'Posting Date' ).
+
+      lo_col = lo_cols->get_column( 'FAEDT' ).
+      lo_col->set_long_text( 'Due Date' ).
+
+      lo_col = lo_cols->get_column( 'DMBTR' ).
+      lo_col->set_long_text( 'Amount' ).
+
+      lo_col = lo_cols->get_column( 'WAERS' ).
+      lo_col->set_long_text( 'Currency' ).
+
+      lo_col = lo_cols->get_column( 'DAYS_OVERDUE' ).
+      lo_col->set_long_text( 'Days Overdue' ).
+
+      lo_col = lo_cols->get_column( 'BUCKET' ).
+      lo_col->set_long_text( 'Aging Bucket' ).
+
+      "Enable full ALV functions (filter, sort, export, etc.)
+      lo_alv->get_functions( )->set_all( abap_true ).
+
+      lo_alv->display( ).
+
+    CATCH cx_salv_msg INTO DATA(lx_msg).
+      MESSAGE lx_msg->get_text( ) TYPE 'E'.
+  ENDTRY.
+
+ENDFORM.

@@ -1,0 +1,39 @@
+@AbapCatalog.sqlViewName: 'ZGLPCBALV'
+@AbapCatalog.compiler.compareFilter: true
+@AccessControl.authorizationCheck: #CHECK
+@EndUserText.label: 'GL Balance by Profit Center'
+@Analytics.dataCategory: #CUBE
+@Analytics.query: true
+@OData.publish: true
+
+define view ZC_GL_BAL_PC
+  as select from acdoca
+{
+  // Key characteristics
+  key acdoca.bukrs          as CompanyCode,
+  key acdoca.gjahr          as FiscalYear,
+  key acdoca.poper          as PostingPeriod,
+  key acdoca.racct          as GLAccount,
+  key acdoca.prctr          as ProfitCenter,
+
+  // Measures
+  @Aggregation.default: #SUM
+  acdoca.hsl                as LocalCurrencyAmount
+}
+where
+      acdoca.bstat = ''      // posted documents only (optional)
+  and acdoca.bukrs in @Session.company_code  // optional, if you use session variables
+
+
+
+@Consumption.filter: { selectionType: #RANGE, mandatory: true }
+acdoca.bukrs as CompanyCode,
+
+@Consumption.filter: { selectionType: #RANGE, mandatory: true }
+acdoca.gjahr as FiscalYear,
+
+@Consumption.filter: { selectionType: #RANGE, mandatory: false }
+acdoca.poper as PostingPeriod,
+
+@Consumption.filter: { selectionType: #RANGE, mandatory: false }
+acdoca.prctr as ProfitCenter,
